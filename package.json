@@ -1,7 +1,8 @@
 {
-  "name": "banana-storyteller",
+  "name": "frond-and-forest",
   "version": "0.1.0",
   "private": true,
+  "description": "A voice-driven interactive story engine for early childhood literacy.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
