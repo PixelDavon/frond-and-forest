@@ -55,7 +55,9 @@ export default function StoryCanvas({
         <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-gradient-to-br from-moss/20 via-story-canvas/80 to-forest/10">
           <div className="h-24 w-24 animate-pulse rounded-full bg-white/70 shadow-inner" />
           <p className="animate-pulse text-center text-lg font-bold text-moss">
-            Sprouting your visual story...
+            {status === "fetching_story"
+              ? "Writing the next story scene..."
+              : "Sprouting your visual story..."}
           </p>
         </div>
       )}

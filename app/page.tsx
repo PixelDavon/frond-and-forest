@@ -6,6 +6,11 @@ import StoryCanvas from "@/components/StoryCanvas";
 import VoiceControls from "@/components/VoiceControls";
 import { useVoiceEngine } from "@/hooks/useVoiceEngine";
 import { cleanTextForSpeech } from "@/lib/utils";
+import {
+  isVoiceSuggestionCurrent,
+  matchVoiceChoice,
+  type VoiceChoiceSuggestion,
+} from "@/lib/voice";
 import type { AppStatus, InteractiveOption, StoryResponse } from "@/lib/types";
 
 function StorySkeleton() {
@@ -28,7 +33,12 @@ export default function Home() {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [appStatus, setAppStatus] = useState<AppStatus>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [voiceFeedback, setVoiceFeedback] = useState<string | null>(null);
+  const [transcript, setTranscript] = useState("");
+  const [voiceSuggestion, setVoiceSuggestion] =
+    useState<VoiceChoiceSuggestion | null>(null);
   const seedRef = useRef<number | undefined>(undefined);
+  const sceneRequestRef = useRef(0);
   const activeImageUrlRef = useRef<string | null>(null);
   const activeNarrationRef = useRef<string | null>(null);
   const imageTransitionRef = useRef(false);
@@ -43,8 +53,11 @@ export default function Home() {
   } = useVoiceEngine();
 
   const startNarration = useCallback(
-    (narrationText: string) => {
-      if (imageTransitionRef.current) {
+    (narrationText: string, requestId: number) => {
+      if (
+        imageTransitionRef.current ||
+        requestId !== sceneRequestRef.current
+      ) {
         return;
       }
 
@@ -63,8 +76,11 @@ export default function Home() {
 
   const handleImageLoaded = useCallback(
     (loadedImageUrl: string) => {
-      if (loadedImageUrl === activeImageUrlRef.current && activeNarrationRef.current) {
-        startNarration(activeNarrationRef.current);
+      if (
+        loadedImageUrl === activeImageUrlRef.current &&
+        activeNarrationRef.current
+      ) {
+        startNarration(activeNarrationRef.current, sceneRequestRef.current);
       }
     },
     [startNarration],
@@ -89,8 +105,10 @@ export default function Home() {
       return;
     }
 
+    const requestId = ++sceneRequestRef.current;
     setImageUrl(null);
     setAppStatus("generating_image");
+    setError(null);
     imageTransitionRef.current = false;
     try {
       const imageResponse = await fetch("/api/image", {
@@ -111,14 +129,20 @@ export default function Home() {
         throw new Error("Image response did not include an image URL");
       }
 
+      if (requestId !== sceneRequestRef.current) {
+        return;
+      }
       activeImageUrlRef.current = imageData.image_url;
       setImageUrl(imageData.image_url);
       imageTimeoutRef.current = setTimeout(() => {
         if (activeNarrationRef.current) {
-          startNarration(activeNarrationRef.current);
+          startNarration(activeNarrationRef.current, requestId);
         }
       }, 3500);
     } catch (requestError) {
+      if (requestId !== sceneRequestRef.current) {
+        return;
+      }
       setError(
         requestError instanceof Error
           ? requestError.message
@@ -130,11 +154,13 @@ export default function Home() {
 
   const loadStory = useCallback(
     async (choice?: InteractiveOption, previousContext?: string) => {
-      setImageUrl(null);
-      activeImageUrlRef.current = null;
-      activeNarrationRef.current = null;
+      const requestId = ++sceneRequestRef.current;
       setAppStatus("fetching_story");
       setError(null);
+      setVoiceFeedback(null);
+      setVoiceSuggestion(null);
+      activeImageUrlRef.current = null;
+      activeNarrationRef.current = null;
       imageTransitionRef.current = false;
       if (imageTimeoutRef.current) {
         clearTimeout(imageTimeoutRef.current);
@@ -157,8 +183,10 @@ export default function Home() {
         }
 
         const nextStory = (await storyResponse.json()) as StoryResponse;
+        if (requestId !== sceneRequestRef.current) {
+          return;
+        }
         seedRef.current = nextStory.seed;
-        setStory(nextStory);
         setAppStatus("generating_image");
 
         const imageResponse = await fetch("/api/image", {
@@ -179,13 +207,20 @@ export default function Home() {
           throw new Error("Image response did not include an image URL");
         }
 
+        if (requestId !== sceneRequestRef.current) {
+          return;
+        }
+        setStory(nextStory);
         activeImageUrlRef.current = imageData.image_url;
         activeNarrationRef.current = nextStory.narration;
         setImageUrl(imageData.image_url);
         imageTimeoutRef.current = setTimeout(() => {
-          startNarration(nextStory.narration);
+          startNarration(nextStory.narration, requestId);
         }, 3500);
       } catch (requestError) {
+        if (requestId !== sceneRequestRef.current) {
+          return;
+        }
         setError(
           requestError instanceof Error
             ? requestError.message
@@ -211,29 +246,95 @@ export default function Home() {
   };
 
   const choose = (choice: InteractiveOption) => {
+    if (appStatus !== "idle") {
+      return;
+    }
     stop();
+    setTranscript("");
+    setVoiceSuggestion(null);
+    setVoiceFeedback(`Choosing “${choice.label}”...`);
     void loadStory(choice, story?.narration);
   };
 
   const toggleMicrophone = () => {
     if (isListening) {
       stop();
+      setVoiceFeedback("Stopped listening.");
       return;
     }
 
-    listen((transcript) => {
-      const normalizedTranscript = transcript.toLowerCase();
-      const matchingChoice = story?.interactive_options.find((choice) =>
-        normalizedTranscript.includes(choice.label.toLowerCase()),
-      );
+    setTranscript("");
+    setVoiceFeedback(null);
+    setVoiceSuggestion(null);
+    listen({
+      onInterim: (interimTranscript) => {
+        setTranscript(interimTranscript);
+      },
+      onFinal: (finalTranscript) => {
+        setTranscript(finalTranscript);
+        const match = story
+          ? matchVoiceChoice(finalTranscript, story.interactive_options)
+          : { kind: "none" as const };
 
-      if (matchingChoice) {
-        stop();
-        choose(matchingChoice);
-      } else {
-        setError(`I heard “${transcript}”. Please try one of the choices.`);
-      }
+        if (match.kind === "exact") {
+          choose(match.choice);
+        } else if (match.kind === "confirm") {
+          setVoiceSuggestion({
+            transcript: finalTranscript,
+            choice: match.choice,
+            sceneId: sceneRequestRef.current,
+          });
+          setVoiceFeedback(null);
+        } else if (match.kind === "ambiguous") {
+          setVoiceFeedback(
+            `I heard “${finalTranscript}”, but more than one choice is close. Please say one choice more clearly or click it directly.`,
+          );
+        } else {
+          setVoiceFeedback(
+            `I heard “${finalTranscript}”, but it does not match the available choices. Try one of the choices below or click it directly.`,
+          );
+        }
+      },
+      onNoSpeech: () => {
+        setVoiceFeedback("I did not hear any speech. Please try again.");
+      },
+      onError: (recognitionError) => {
+        const messages = {
+          "speech-recognition-unsupported":
+            "Voice choices are not supported in this browser.",
+          "permission-denied":
+            "Microphone permission was denied. Allow microphone access and try again.",
+          "no-speech": "I did not hear any speech. Please try again.",
+          "speech-recognition-error":
+            "Voice recognition stopped unexpectedly. Please try again.",
+          "speech-synthesis-unsupported":
+            "Narration is not supported in this browser.",
+        } as const;
+        setVoiceFeedback(messages[recognitionError]);
+      },
     });
+  };
+
+  const confirmVoiceSuggestion = () => {
+    if (
+      !voiceSuggestion ||
+      !story ||
+      !isVoiceSuggestionCurrent(
+        voiceSuggestion,
+        sceneRequestRef.current,
+        story.interactive_options,
+      )
+    ) {
+      setVoiceSuggestion(null);
+      setVoiceFeedback("That suggestion is no longer available. Please try again.");
+      return;
+    }
+    choose(voiceSuggestion.choice);
+  };
+
+  const rejectVoiceSuggestion = () => {
+    setVoiceSuggestion(null);
+    setVoiceFeedback("Try saying one of the choices again.");
   };
 
   if (!hasStarted) {
@@ -334,6 +435,11 @@ export default function Home() {
                   <div className="mt-6">
                     <VoiceControls
                       isListening={isListening}
+                      transcript={transcript}
+                      feedback={voiceFeedback}
+                      suggestion={voiceSuggestion}
+                      onConfirmSuggestion={confirmVoiceSuggestion}
+                      onRejectSuggestion={rejectVoiceSuggestion}
                       onMicToggle={toggleMicrophone}
                       status={appStatus}
                     />
@@ -343,19 +449,19 @@ export default function Home() {
                     Voice choices are not supported in this browser.
                   </p>
                 )}
-                {voiceError && (
+                {voiceError === "speech-synthesis-unsupported" && (
                   <p className="mt-3 text-center text-xs text-rose-500">
-                    Voice controls are unavailable right now.
+                    Narration is not supported in this browser.
                   </p>
                 )}
               </>
             )}
             {error && (
               <div className="mt-6 rounded-2xl bg-rose-50 p-4 text-sm font-semibold text-rose-700">
-                <p>We could not load the next scene.</p>
+                <p>We could not prepare the next scene: {error}</p>
                 <button
                   type="button"
-                  onClick={() => void loadStory()}
+                  onClick={() => void loadStory(undefined, story?.narration)}
                   className="mt-2 underline"
                 >
                   Try again

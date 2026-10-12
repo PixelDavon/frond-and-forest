@@ -1,16 +1,32 @@
-import { NextResponse } from 'next/server';
+import { NextResponse } from "next/server";
+import {
+  ApiValidationError,
+  MAX_IMAGE_BODY_BYTES,
+  MAX_IMAGE_PROMPT_LENGTH,
+  optionalSeed,
+  readJsonObject,
+  requiredString,
+} from "@/lib/api-validation";
+
+const IMAGE_TIMEOUT_MS = 10_000;
 
 export async function POST(req: Request) {
   try {
-    const { prompt, seed } = await req.json();
-    const cleanPrompt = prompt
-      .replace(/[^a-zA-Z0-9 ,.-]/g, '')
-      .slice(0, 280);
-    
-    // Strategy 1: Server-Side Cloudflare Workers AI (FLUX.1 [schnell])
+    const body = await readJsonObject(req, MAX_IMAGE_BODY_BYTES);
+    const prompt = requiredString(
+      body.prompt,
+      "prompt",
+      MAX_IMAGE_PROMPT_LENGTH,
+    );
+    const seed = optionalSeed(body.seed) ?? 0;
+    const cleanPrompt = prompt.replace(/[^a-zA-Z0-9 ,.-]/g, "").slice(0, 280);
+    if (!cleanPrompt.trim()) {
+      throw new ApiValidationError("prompt must contain usable text.");
+    }
+
     if (process.env.CF_ACCOUNT_ID && process.env.CF_API_TOKEN) {
       try {
-        const cfRes = await fetch(
+        const cloudflareResponse = await fetch(
           `https://api.cloudflare.com/client/v4/accounts/${process.env.CF_ACCOUNT_ID}/ai/run/@cf/black-forest-labs/flux-1-schnell`,
           {
             method: "POST",
@@ -20,39 +36,57 @@ export async function POST(req: Request) {
             },
             body: JSON.stringify({
               prompt: cleanPrompt,
-              steps: 4
+              steps: 4,
             }),
-            signal: AbortSignal.timeout(10000),
-          }
+            signal: AbortSignal.timeout(IMAGE_TIMEOUT_MS),
+          },
         );
 
-        if (cfRes.ok) {
-          const cfData = await cfRes.json();
-          const rawBase64 = cfData.result?.image;
-          if (rawBase64) {
+        if (cloudflareResponse.ok) {
+          const cloudflareData: unknown = await cloudflareResponse.json();
+          if (
+            cloudflareData &&
+            typeof cloudflareData === "object" &&
+            "result" in cloudflareData &&
+            cloudflareData.result &&
+            typeof cloudflareData.result === "object" &&
+            "image" in cloudflareData.result &&
+            typeof cloudflareData.result.image === "string" &&
+            cloudflareData.result.image.length > 0
+          ) {
             return NextResponse.json({
-              image_url: `data:image/jpeg;base64,${rawBase64}`,
-              provider: "cloudflare"
+              image_url: `data:image/jpeg;base64,${cloudflareData.result.image}`,
+              provider: "cloudflare",
             });
           }
-          console.error("Cloudflare AI response missing image:", cfData);
+          console.error("Cloudflare image response did not contain an image.");
         } else {
-          console.error("Cloudflare AI Error:", cfRes.status, await cfRes.text());
+          console.error("Cloudflare image provider returned a non-OK response.");
         }
-      } catch (cfErr) {
-        console.warn("Cloudflare FLUX failed. Falling back to Pollinations...", cfErr);
+      } catch {
+        console.warn("Cloudflare image provider failed; using fallback.");
       }
     }
 
-    // Strategy 2: Zero-Key Fallback (Pollinations.ai)
     const encodedPrompt = encodeURIComponent(cleanPrompt);
     const pollinationsUrl = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=1024&height=1024&seed=${seed}&nologo=true&model=flux`;
 
-    return NextResponse.json({ 
+    return NextResponse.json({
       image_url: pollinationsUrl,
-      provider: "pollinations"
-    }); 
-  } catch {
-    return NextResponse.json({ error: "Failed to render image" }, { status: 500 });
+      provider: "pollinations",
+    });
+  } catch (error: unknown) {
+    if (error instanceof ApiValidationError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 400 },
+      );
+    }
+
+    console.error("Image API request failed.");
+    return NextResponse.json(
+      { error: "Failed to render image." },
+      { status: 502 },
+    );
   }
 }

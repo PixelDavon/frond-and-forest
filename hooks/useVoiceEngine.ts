@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 type SpeechRecognitionResultEvent = Event & {
+  resultIndex: number;
   results: SpeechRecognitionResultList;
 };
 
@@ -23,10 +24,19 @@ type SpeechRecognitionInstance = {
 
 type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance;
 
-type VoiceEngineError =
+export type VoiceRecognitionError =
   | "speech-synthesis-unsupported"
   | "speech-recognition-unsupported"
+  | "permission-denied"
+  | "no-speech"
   | "speech-recognition-error";
+
+interface ListenCallbacks {
+  onInterim: (transcript: string) => void;
+  onFinal: (transcript: string) => void;
+  onNoSpeech: () => void;
+  onError: (error: VoiceRecognitionError) => void;
+}
 
 declare global {
   interface Window {
@@ -34,11 +44,22 @@ declare global {
   }
 }
 
+function mapRecognitionError(error: string): VoiceRecognitionError {
+  if (error === "not-allowed" || error === "service-not-allowed") {
+    return "permission-denied";
+  }
+  if (error === "no-speech") {
+    return "no-speech";
+  }
+  return "speech-recognition-error";
+}
+
 export function useVoiceEngine() {
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const recognitionSessionRef = useRef(0);
   const selectedVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const [isListening, setIsListening] = useState(false);
-  const [error, setError] = useState<VoiceEngineError | null>(null);
+  const [error, setError] = useState<VoiceRecognitionError | null>(null);
 
   const isSpeechSynthesisSupported =
     typeof window !== "undefined" && "speechSynthesis" in window;
@@ -90,42 +111,90 @@ export function useVoiceEngine() {
   );
 
   const stopListening = useCallback(() => {
+    recognitionSessionRef.current += 1;
     recognitionRef.current?.stop();
     recognitionRef.current = null;
     setIsListening(false);
   }, []);
 
   const listen = useCallback(
-    (callback: (transcript: string) => void) => {
-      if (typeof window === "undefined") {
+    (callbacks: ListenCallbacks) => {
+      if (typeof window === "undefined" || !window.webkitSpeechRecognition) {
         setError("speech-recognition-unsupported");
-        return;
-      }
-
-      const Recognition = window.webkitSpeechRecognition;
-      if (!Recognition) {
-        setError("speech-recognition-unsupported");
+        callbacks.onError("speech-recognition-unsupported");
         return;
       }
 
       stopListening();
+      const Recognition = window.webkitSpeechRecognition;
       const recognition = new Recognition();
+      recognitionSessionRef.current += 1;
+      const sessionId = recognitionSessionRef.current;
+      const processedFinalTranscripts = new Set<string>();
+      let receivedUsableResult = false;
+      let receivedError = false;
+
       recognition.continuous = false;
-      recognition.interimResults = false;
+      recognition.interimResults = true;
       recognition.lang = "en-US";
       recognition.onresult = (event) => {
-        const transcript = event.results[0]?.[0]?.transcript;
-        if (transcript) {
-          callback(transcript);
+        if (
+          sessionId !== recognitionSessionRef.current ||
+          recognitionRef.current !== recognition
+        ) {
+          return;
+        }
+
+        let interimTranscript = "";
+        let finalTranscript = "";
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const transcript = result?.[0]?.transcript?.trim() ?? "";
+          if (result?.isFinal) {
+            finalTranscript += `${transcript} `;
+          } else {
+            interimTranscript += `${transcript} `;
+          }
+        }
+
+        if (interimTranscript.trim()) {
+          receivedUsableResult = true;
+          callbacks.onInterim(interimTranscript.trim());
+        }
+
+        const trimmedFinal = finalTranscript.trim();
+        if (trimmedFinal) {
+          receivedUsableResult = true;
+          const normalizedFinal = trimmedFinal.toLocaleLowerCase();
+          if (!processedFinalTranscripts.has(normalizedFinal)) {
+            processedFinalTranscripts.add(normalizedFinal);
+            callbacks.onFinal(trimmedFinal);
+          }
         }
       };
-      recognition.onerror = () => {
-        setError("speech-recognition-error");
+      recognition.onerror = (event) => {
+        if (sessionId !== recognitionSessionRef.current) {
+          return;
+        }
+        receivedError = true;
+        const mappedError = mapRecognitionError(event.error);
+        setError(mappedError);
         setIsListening(false);
+        callbacks.onError(mappedError);
       };
       recognition.onend = () => {
+        if (
+          sessionId !== recognitionSessionRef.current ||
+          recognitionRef.current !== recognition
+        ) {
+          return;
+        }
         recognitionRef.current = null;
         setIsListening(false);
+        if (!receivedUsableResult && !receivedError) {
+          setError("no-speech");
+          callbacks.onNoSpeech();
+        }
       };
 
       recognitionRef.current = recognition;
@@ -134,9 +203,12 @@ export function useVoiceEngine() {
       try {
         recognition.start();
       } catch {
-        recognitionRef.current = null;
-        setIsListening(false);
-        setError("speech-recognition-error");
+        if (sessionId === recognitionSessionRef.current) {
+          recognitionRef.current = null;
+          setIsListening(false);
+          setError("speech-recognition-error");
+          callbacks.onError("speech-recognition-error");
+        }
       }
     },
     [stopListening],
@@ -158,10 +230,10 @@ export function useVoiceEngine() {
       if (window.speechSynthesis.onvoiceschanged === updateVoice) {
         window.speechSynthesis.onvoiceschanged = null;
       }
-      recognitionRef.current?.stop();
-      window.speechSynthesis?.cancel();
+      stopListening();
+      window.speechSynthesis.cancel();
     };
-  }, [getBestVoice, isSpeechSynthesisSupported]);
+  }, [getBestVoice, isSpeechSynthesisSupported, stopListening]);
 
   return {
     speak,

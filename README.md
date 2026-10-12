@@ -93,7 +93,7 @@ The next scene is generated on demand. Image generation follows story generation
 
 The story API expects JSON rather than plain text. It removes optional Markdown code fences before parsing the response.
 
-This handles some common formatting variations, but it does not guarantee valid output. Malformed JSON or missing fields can still cause a request to fail.
+The route now validates the parsed response at runtime, including narration, image prompt, and a bounded list of choices. Malformed JSON or missing fields receive a controlled error instead of being returned as a story scene.
 
 ### Supporting multiple image providers
 
@@ -210,11 +210,17 @@ CF_ACCOUNT_ID=your_cloudflare_account_id
 CF_API_TOKEN=your_cloudflare_api_token
 ```
 
-`FEATHERLESS_API_KEY` is the intended server-side configuration for the story model. The current audited version still has the Featherless authorization credential embedded directly in `app/api/story/route.ts`, so that route must first be updated to read `process.env.FEATHERLESS_API_KEY`. Do not publish the embedded credential; rotate it if it has been exposed.
+`FEATHERLESS_API_KEY` is required for story generation and is read only by the server route. The checked-in [.env.example](./.env.example) contains placeholders only.
 
 `CF_ACCOUNT_ID` and `CF_API_TOKEN` enable the primary Cloudflare image-generation route. They are optional if you use the Pollinations.ai fallback.
 
 Never commit `.env.local` or expose API credentials in client-side code.
+
+### Safety and operational limits
+
+The story prompt asks the model for gentle, age-appropriate content and the server validates output shape and size. This is not a moderation system: generated text and images are not independently safety-classified, so the application remains a supervised prototype and is not suitable for unsupervised public use.
+
+Both API routes enforce bounded request sizes and upstream timeouts. No distributed rate limiter is active in this repository; production deployment should add an edge or provider-backed limiter (for example, a managed Redis-based service) before public exposure.
 
 ### 3. Start the development server
 
